@@ -30,3 +30,13 @@ _testmain.go
 *.exe
 *.test
 *.prof
+
+# Local credentials and authentication files
+.env
+.env.*
+*.pem
+*.key
+key.txt
+auth.json
+credentials.json
+*token*.txt
