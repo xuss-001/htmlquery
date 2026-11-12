@@ -7,6 +7,8 @@ import (
 	"bufio"
 	"compress/gzip"
 	"compress/zlib"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -96,6 +98,169 @@ func LoadURL(url string) (*html.Node, error) {
 	return LoadURLWithClient(url, http.DefaultClient)
 }
 
+// LoadOptions configures LoadURLWithOptions.
+type LoadOptions struct {
+	// Client is the HTTP client used to send the request. If nil,
+	// http.DefaultClient is used.
+	Client *http.Client
+	// MaxResponseBytes limits the number of bytes read from the HTTP
+	// response body before decompression and charset conversion. A value
+	// of zero disables the limit; negative values are invalid.
+	MaxResponseBytes int64
+	// MaxDocumentBytes limits the number of UTF-8 document bytes passed to
+	// the HTML parser after decompression and charset conversion. A value
+	// of zero disables the limit; negative values are invalid.
+	MaxDocumentBytes int64
+}
+
+var (
+	// ErrResponseTooLarge indicates that the HTTP response body exceeded
+	// LoadOptions.MaxResponseBytes.
+	ErrResponseTooLarge = errors.New("htmlquery: response body exceeds the configured size limit")
+	// ErrDocumentTooLarge indicates that the decoded document exceeded
+	// LoadOptions.MaxDocumentBytes.
+	ErrDocumentTooLarge = errors.New("htmlquery: document exceeds the configured size limit")
+)
+
+// HTTPStatusError reports a non-success HTTP status returned by
+// LoadURLWithOptions.
+type HTTPStatusError struct {
+	// StatusCode is the final HTTP response status code.
+	StatusCode int
+	// URL is the final response URL after following redirects.
+	URL string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("htmlquery: unexpected HTTP status %d for %s", e.StatusCode, e.URL)
+}
+
+// LoadURLWithOptions loads and parses the HTML document from the specified
+// URL. The context controls both the request and reads from the response body.
+//
+// Only final HTTP status codes in the 200-299 range are parsed. Response and
+// decoded document size limits are enforced while the data is being read.
+// A nil context or a negative limit is rejected before the request is sent.
+func LoadURLWithOptions(ctx context.Context, url string, options LoadOptions) (*html.Node, error) {
+	if ctx == nil {
+		return nil, errors.New("htmlquery: nil context")
+	}
+	if options.MaxResponseBytes < 0 {
+		return nil, errors.New("htmlquery: MaxResponseBytes must not be negative")
+	}
+	if options.MaxDocumentBytes < 0 {
+		return nil, errors.New("htmlquery: MaxDocumentBytes must not be negative")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	client := options.Client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Ask for gzip when possible. If the client's Transport transparently
+	// decompresses instead, the response limit still applies to the bytes the
+	// Transport hands to this package.
+	req.Header.Add("Accept-Encoding", "gzip")
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, err
+	}
+	if resp == nil {
+		return nil, errors.New("htmlquery: HTTP client returned a nil response")
+	}
+
+	finalURL := url
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String()
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		if resp.Body != nil {
+			resp.Body.Close()
+		}
+		return nil, &HTTPStatusError{StatusCode: resp.StatusCode, URL: finalURL}
+	}
+	if resp.Body == nil {
+		return nil, errors.New("htmlquery: HTTP response body is nil")
+	}
+	defer resp.Body.Close()
+
+	bodyRecorder := &recordingReader{reader: resp.Body}
+	responseLimiter := newLimitedReader(bodyRecorder, ctx, options.MaxResponseBytes, ErrResponseTooLarge)
+	var responseReader io.Reader = responseLimiter
+	var decodedRecorder *recordingReader
+	encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	if resp.Uncompressed {
+		encoding = ""
+	}
+	switch encoding {
+	case "gzip":
+		gzipReader, err := gzip.NewReader(responseReader)
+		if err != nil {
+			if limitErr := readLimitError(ctx, responseLimiter, nil); limitErr != nil {
+				return nil, limitErr
+			}
+			return nil, readError(ctx, err)
+		}
+		defer gzipReader.Close()
+		decodedRecorder = &recordingReader{reader: gzipReader}
+		responseReader = decodedRecorder
+	case "deflate":
+		zlibReader, err := zlib.NewReader(responseReader)
+		if err != nil {
+			if limitErr := readLimitError(ctx, responseLimiter, nil); limitErr != nil {
+				return nil, limitErr
+			}
+			return nil, readError(ctx, err)
+		}
+		defer zlibReader.Close()
+		decodedRecorder = &recordingReader{reader: zlibReader}
+		responseReader = decodedRecorder
+	case "", "identity":
+	default:
+		return nil, fmt.Errorf("%s compression is not supported", encoding)
+	}
+
+	documentReader, err := charset.NewReader(responseReader, resp.Header.Get("Content-Type"))
+	if err != nil {
+		if limitErr := readLimitError(ctx, responseLimiter, nil); limitErr != nil {
+			return nil, limitErr
+		}
+		return nil, readError(ctx, err)
+	}
+	documentLimiter := newLimitedReader(documentReader, ctx, options.MaxDocumentBytes, ErrDocumentTooLarge)
+	documentReader = documentLimiter
+	documentRecorder := &recordingReader{reader: documentReader}
+	doc, err := html.Parse(documentRecorder)
+	if err != nil {
+		if limitErr := readLimitError(ctx, responseLimiter, documentLimiter); limitErr != nil {
+			return nil, limitErr
+		}
+		return nil, readError(ctx, err)
+	}
+	if limitErr := readLimitError(ctx, responseLimiter, documentLimiter); limitErr != nil {
+		return nil, limitErr
+	}
+	if documentRecorder.err != nil {
+		return nil, readError(ctx, documentRecorder.err)
+	}
+	if decodedRecorder != nil && decodedRecorder.err != nil {
+		return nil, readError(ctx, decodedRecorder.err)
+	}
+	if bodyRecorder.err != nil {
+		return nil, readError(ctx, bodyRecorder.err)
+	}
+	return doc, nil
+}
+
 // LoadURLWithCustomClient loads the HTML document from the specified URL. Default enabling gzip on a HTTP request.
 // Custom HTTP Client.
 func LoadURLWithClient(url string, client *http.Client) (*html.Node, error) {
@@ -141,6 +306,108 @@ func LoadURLWithClient(url string, client *http.Client) (*html.Node, error) {
 		return nil, err
 	}
 	return html.Parse(r)
+}
+
+type limitedReader struct {
+	reader      io.Reader
+	ctx         context.Context
+	remaining   int64
+	tooLargeErr error
+	exceeded    bool
+}
+
+func newLimitedReader(reader io.Reader, ctx context.Context, max int64, tooLargeErr error) *limitedReader {
+	if max == 0 {
+		tooLargeErr = nil
+	}
+	return &limitedReader{
+		reader:      reader,
+		ctx:         ctx,
+		remaining:   max,
+		tooLargeErr: tooLargeErr,
+	}
+}
+
+type recordingReader struct {
+	reader io.Reader
+	err    error
+}
+
+func (r *recordingReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if err != nil && err != io.EOF && r.err == nil {
+		r.err = err
+	}
+	return n, err
+}
+
+func (r *limitedReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	if r.exceeded {
+		return 0, r.tooLargeErr
+	}
+
+	if r.remaining == 0 && r.tooLargeErr == nil {
+		n, err := r.reader.Read(p)
+		return r.withContext(n, err)
+	}
+	if r.remaining > 0 {
+		maxRead := int64(len(p))
+		if r.remaining < maxRead {
+			// Read one byte past the limit so a body or document that ends
+			// exactly at the limit can still succeed.
+			maxRead = r.remaining + 1
+		}
+		n, err := r.reader.Read(p[:int(maxRead)])
+		if int64(n) > r.remaining {
+			r.exceeded = true
+			return r.withContext(0, r.tooLargeErr)
+		}
+		r.remaining -= int64(n)
+		return r.withContext(n, err)
+	}
+
+	// The limit has been reached. Probe for one more byte and stop reading
+	// immediately if it exists.
+	var one [1]byte
+	n, err := r.reader.Read(one[:])
+	if n > 0 {
+		r.exceeded = true
+		return r.withContext(0, r.tooLargeErr)
+	}
+	return r.withContext(0, err)
+}
+
+func (r *limitedReader) withContext(n int, err error) (int, error) {
+	if ctxErr := r.ctx.Err(); ctxErr != nil {
+		return n, ctxErr
+	}
+	return n, err
+}
+
+func readError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
+}
+
+func readLimitError(ctx context.Context, response, document *limitedReader) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if response != nil && response.exceeded {
+		return response.tooLargeErr
+	}
+	if document != nil && document.exceeded {
+		return document.tooLargeErr
+	}
+	return nil
 }
 
 // LoadDoc loads the HTML document from the specified file path.

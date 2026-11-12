@@ -43,6 +43,58 @@ if err != nil {
 doc, err := htmlquery.LoadURL("http://example.com/")
 ```
 
+#### Load an HTML document with cancellation and size limits.
+
+`LoadURLWithOptions` accepts a context and per-call limits without changing
+the behavior of the existing `LoadURL` and `LoadURLWithClient` functions.
+
+```go
+options := htmlquery.LoadOptions{
+	Client:           httpClient, // nil uses http.DefaultClient
+	MaxResponseBytes: 10 << 20,   // bytes read from the response Body
+	MaxDocumentBytes: 20 << 20,   // decoded UTF-8 bytes passed to the parser
+}
+
+doc, err := htmlquery.LoadURLWithOptions(ctx, url, options)
+switch {
+case errors.Is(err, htmlquery.ErrResponseTooLarge):
+	// Skip the HTTP response body limit violation.
+case errors.Is(err, htmlquery.ErrDocumentTooLarge):
+	// Skip the decoded document limit violation.
+case err != nil:
+	var statusErr *htmlquery.HTTPStatusError
+	if errors.As(err, &statusErr) {
+		log.Printf("HTTP %d at %s", statusErr.StatusCode, statusErr.URL)
+	}
+}
+```
+
+`MaxResponseBytes` is checked while the response body is read, before
+htmlquery decompresses gzip or zlib deflate data and before charset conversion.
+If the client's `Transport` transparently decompresses the response, the limit
+applies to the decompressed bytes supplied by that `Transport`. `MaxDocumentBytes`
+is checked while the decoded UTF-8 document is passed to the HTML parser.
+Zero disables the corresponding limit. Exact-limit data is accepted; one extra
+byte returns the corresponding sentinel error.
+
+The context controls both the request and response body reads, so cancellation
+and deadlines are reported through `errors.Is(err, context.Canceled)` and
+`errors.Is(err, context.DeadlineExceeded)`. Only final HTTP status codes from
+200 through 299 are parsed. Other statuses return `*htmlquery.HTTPStatusError`
+before the body is decoded or parsed.
+
+The supplied `http.Client` is never modified, so its `Transport`, `Timeout`,
+`CheckRedirect`, and `Jar` settings remain effective and the same client can be
+used concurrently with different limits. The library always closes the
+response body it consumes.
+
+For a runnable, local-only example that uses XPath and continues after an
+oversized page is rejected, run:
+
+```sh
+go run ./examples/load_url_with_options
+```
+
 #### Load HTML from document.
 
 ```go
